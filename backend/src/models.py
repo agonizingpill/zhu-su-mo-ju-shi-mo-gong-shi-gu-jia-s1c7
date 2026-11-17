@@ -1,4 +1,4 @@
-from sqlalchemy import String, Float, Integer, ForeignKey, JSON, CheckConstraint, UniqueConstraint
+from sqlalchemy import String, Float, Integer, ForeignKey, JSON, CheckConstraint, UniqueConstraint, Index, text
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 class User(Base):
@@ -17,6 +17,7 @@ class Mould(Base):
     slides: Mapped[int]=mapped_column(Integer)
     steel: Mapped[str]=mapped_column(String(20))
     weight_kg: Mapped[float]=mapped_column(Float)
+    spec_version: Mapped[int]=mapped_column(Integer,default=1)
 class MachineSlot(Base):
     __tablename__='machine_slots'
     __table_args__=(UniqueConstraint('machine','start_hour'),CheckConstraint('capacity_hours > 0 AND reserved_hours >= 0 AND reserved_hours <= capacity_hours'),)
@@ -38,6 +39,29 @@ class Estimate(Base):
     quote_amount: Mapped[float]=mapped_column(Float)
     status: Mapped[str]=mapped_column(String(20),default='draft')
     model_result: Mapped[dict|None]=mapped_column(JSON,nullable=True)
+    current_release_id: Mapped[int|None]=mapped_column(Integer,nullable=True)
+    active_release_id: Mapped[int|None]=mapped_column(Integer,nullable=True)
+class EstimateRelease(Base):
+    """Prediction, training-sample snapshot and explanation evidence publish as one fenced version."""
+    __tablename__='estimate_releases'
+    __table_args__=(UniqueConstraint('estimate_id','version'),
+                    Index('uq_estimate_releases_pending','estimate_id',unique=True,postgresql_where=text("status='pending'")),
+                    CheckConstraint('predicted_hours IS NULL OR predicted_hours > 0'),)
+    id: Mapped[int]=mapped_column(primary_key=True)
+    estimate_id: Mapped[int]=mapped_column(ForeignKey('estimates.id'))
+    version: Mapped[int]=mapped_column(Integer)
+    spec_version: Mapped[int]=mapped_column(Integer)
+    spec_snapshot: Mapped[dict]=mapped_column(JSON)
+    sample_snapshot: Mapped[dict|None]=mapped_column(JSON,nullable=True)
+    predicted_hours: Mapped[float|None]=mapped_column(Float,nullable=True)
+    evidence: Mapped[dict|None]=mapped_column(JSON,nullable=True)
+    status: Mapped[str]=mapped_column(String(20),default='pending')
+    reason: Mapped[str]=mapped_column(String(600),default='')
+    artifact_path: Mapped[str|None]=mapped_column(String(200),nullable=True)
+    attempts: Mapped[int]=mapped_column(Integer,default=0)
+    created_at: Mapped[str]=mapped_column(String(40))
+    published_at: Mapped[str|None]=mapped_column(String(40),nullable=True)
+    last_enqueued_at: Mapped[str|None]=mapped_column(String(40),nullable=True)
 class TrialHistory(Base):
     __tablename__='trial_history'
     id: Mapped[int]=mapped_column(primary_key=True)

@@ -7,21 +7,24 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select,func
 from sqlalchemy.exc import IntegrityError
 from .db import Base,engine,db_session
-from .models import User,Mould,Estimate,MachineSlot,TrialHistory,Audit
+from .models import User,Mould,Estimate,MachineSlot,TrialHistory,Audit,EstimateRelease
 from .auth import current,writers,admin,verify,token
 from .schemas import Login,MouldInput,EstimateInput,QuoteInput,SlotChoice,SlotInput
-from .services import item,serialize,record,require_edit,request_capacity,commit_capacity
+from .services import item,serialize,record,require_edit,locked_estimate,request_capacity,commit_capacity
+from .release_service import QUEUE,ensure_columns,backfill_releases,open_calculation,invalidate_for_revision
 from .middlewares import RequestTrace,BurstGuard
-from .constants import ROLES,ESTIMATE_STATES,STEELS,EXECUTION_STATES,REVIEW_STATES,MAINTENANCE_STATES,RESIN_STATES,MATERIAL_STATES,DELIVERY_STATES
+from .constants import ROLES,ESTIMATE_STATES,STEELS,RELEASE_STATES,EXECUTION_STATES,REVIEW_STATES,MAINTENANCE_STATES,RESIN_STATES,MATERIAL_STATES,DELIVERY_STATES
 r=redis.Redis.from_url(os.environ['REDIS_URL'],decode_responses=True)
 @asynccontextmanager
 async def lifespan(app):
     Base.metadata.create_all(engine)
+    ensure_columns()
     if os.getenv('SEED_DEMO','true').lower()=='true':
         try:
             from scripts.seed_demo import seed
             seed()
         except Exception: logging.exception('demo seed failed')
+    backfill_releases()
     yield
 app=FastAPI(title='锐模 · 试模工时估价',lifespan=lifespan)
 from .execution_routes import router as execution_router
@@ -43,7 +46,7 @@ def login(p:Login,s=Depends(db_session)):
 @app.get('/me')
 def me(u=Depends(current)):return {'email':u.email,'role':u.role}
 @app.get('/enums')
-def enums(u=Depends(current)):return {'roles':ROLES,'estimate_states':ESTIMATE_STATES,'steels':STEELS,'execution_states':EXECUTION_STATES,'review_states':REVIEW_STATES,'maintenance_states':MAINTENANCE_STATES,'resin_states':RESIN_STATES,'material_states':MATERIAL_STATES,'delivery_states':DELIVERY_STATES}
+def enums(u=Depends(current)):return {'roles':ROLES,'estimate_states':ESTIMATE_STATES,'steels':STEELS,'release_states':RELEASE_STATES,'execution_states':EXECUTION_STATES,'review_states':REVIEW_STATES,'maintenance_states':MAINTENANCE_STATES,'resin_states':RESIN_STATES,'material_states':MATERIAL_STATES,'delivery_states':DELIVERY_STATES}
 @app.get('/moulds')
 def moulds(s=Depends(db_session),u=Depends(current)):return [serialize(x) for x in s.scalars(select(Mould).order_by(Mould.id))]
 @app.post('/moulds')
@@ -52,12 +55,12 @@ def add_mould(p:MouldInput,s=Depends(db_session),u=Depends(writers)):
 @app.put('/moulds/{mid}')
 def edit_mould(mid:int,p:MouldInput,s=Depends(db_session),u=Depends(writers)):
     m=item(s,Mould,mid)
-    if s.scalar(select(Estimate.id).where(Estimate.mould_id==mid,Estimate.status.in_(['calculating','requested','committed']))):raise HTTPException(409,'已有计算、机时申请或生产承诺，模具规格已锁定')
+    # Revision is allowed even mid-calculation: old estimates and requests are invalidated,
+    # stale releases voided (late worker results are rejected); committed estimates are kept.
+    kept,voided=invalidate_for_revision(s,m.id)
     for k,v in p.model_dump().items():setattr(m,k,v)
-    # Historical model results must be invalidated when source specifications change.
-    for e in s.scalars(select(Estimate).where(Estimate.mould_id==mid)):
-        e.status='draft';e.predicted_hours=None;e.model_result=None;e.slot_id=None
-    record(s,u,'修订模具 '+m.code);s.commit();return serialize(m)
+    m.spec_version=Mould.spec_version+1
+    record(s,u,f'修订模具 {p.code} 规格升版（作旧发布 {voided} 版，保留已承诺 {kept} 单）');s.commit();return serialize(m)
 @app.get('/estimates')
 def estimates(s=Depends(db_session),u=Depends(current)):return [serialize(x) for x in s.scalars(select(Estimate).order_by(Estimate.id.desc()))]
 @app.post('/estimates')
@@ -70,16 +73,18 @@ def quote(eid:int,p:QuoteInput,s=Depends(db_session),u=Depends(writers)):
     record(s,u,'修订报价 '+e.code);s.commit();return serialize(e)
 @app.post('/estimates/{eid}/calculate')
 def calculate(eid:int,s=Depends(db_session),u=Depends(writers)):
-    e=item(s,Estimate,eid);require_edit(e)
-    if e.status=='requested':raise HTTPException(409,'已申请机时，请先修改报价撤回申请')
-    e.status='calculating';e.predicted_hours=None;e.model_result=None;record(s,u,'估算入队 '+e.code);s.commit()
-    try:r.rpush('mould-estimates',e.id)
-    except Exception:
-        e.status='failed';s.commit();raise HTTPException(503,'计算队列暂不可用，请重试')
+    e=locked_estimate(s,eid)
+    rel,created=open_calculation(s,e,u);s.commit()
+    try:r.rpush(QUEUE,rel.id)
+    except Exception:logging.exception('enqueue push failed; recovery sweeper will retry')
     return serialize(e)
+@app.get('/estimates/{eid}/releases')
+def releases(eid:int,s=Depends(db_session),u=Depends(current)):
+    item(s,Estimate,eid)
+    return [serialize(x) for x in s.scalars(select(EstimateRelease).where(EstimateRelease.estimate_id==eid).order_by(EstimateRelease.version.desc()))]
 @app.post('/estimates/{eid}/request')
 def request(eid:int,p:SlotChoice,s=Depends(db_session),u=Depends(writers)):
-    e=item(s,Estimate,eid);request_capacity(s,e,p.slot_id);record(s,u,'申请机时 '+e.code);s.commit();return serialize(e)
+    e=locked_estimate(s,eid);request_capacity(s,e,p.slot_id);record(s,u,'申请机时 '+e.code);s.commit();return serialize(e)
 @app.post('/estimates/{eid}/commit')
 def commit(eid:int,s=Depends(db_session),u=Depends(admin)):
     e=commit_capacity(s,eid);record(s,u,'承诺排程 '+e.code);s.commit();return serialize(e)
